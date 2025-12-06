@@ -96,6 +96,8 @@ class ReferenceValidator:
 
     def renumber_if_needed(self, save_path=None):
         """
+        Reorder references based on citation appearance order and renumber everything.
+        This will physically move reference paragraphs to match the citation sequence.
         If citation sequence is not ordered, renumber citations and reference list.
         Writes changes back to the document (overwrites original unless save_path provided).
         """
@@ -125,7 +127,6 @@ class ReferenceValidator:
                 ordered_all.append(n)
 
         renumber_map = {old: new for new, old in enumerate(ordered_all, start=1)}
-        new_to_old = {v: k for k, v in renumber_map.items()}
 
         # Reopen document writable
         try:
@@ -136,234 +137,17 @@ class ReferenceValidator:
             # try opening without ReadOnly named arg
             self.doc = self.word.Documents.Open(self.filepath)
 
-        # ---------------------------------------------------------
-        # 1. Update Citations in Text (cite_bib)
-        # ---------------------------------------------------------
-        try:
-            cite_style = self.doc.Styles("cite_bib")
-        except Exception:
-            cite_style = None
-
-        if cite_style:
-            rng = self.doc.Content
-            rng.Find.ClearFormatting()
-            rng.Find.Style = cite_style
-            rng.Find.Text = ""
-            while rng.Find.Execute():
-                text = rng.Text.strip()
-                if not text:
-                    rng.Collapse(0)
-                    continue
-                nums = self._extract_numbers(text)
-                if not nums:
-                    rng.Collapse(0)
-                    continue
-
-                # Map numbers
-                mapped = [renumber_map.get(n, n) for n in nums]
-                new_text = self._numbers_to_string(mapped)
-
-                # Replace only the numeric portion
-                new_display = re.sub(r'\d+(-\d+)?', lambda m: self._mapped_segment(m.group(0), renumber_map), text)
-                if not re.search(r'\d', new_display):
-                    new_display = new_text
-
-                try:
-                    rng.Text = new_display
-                except Exception:
-                    pass
-                rng.Collapse(0)
-
-        # ---------------------------------------------------------
-        # 2. Sort and Renumber Reference List (REF-N)
-        # ---------------------------------------------------------
-        # We need to physically move paragraphs to match the new order (1, 2, 3...)
-        # Strategy: Copy all REF-N paragraphs to a temp doc, then paste them back in the correct order.
+        # Update citations in text
+        self._update_citations(renumber_map)
         
-        try:
-            refpara_style = self.doc.Styles("REF-N")
-        except Exception:
-            refpara_style = None
-
-        if refpara_style:
-            # A. Collect all REF-N paragraphs from source
-            # We assume the current order in doc corresponds to ref_numbers sorted (1, 2, 3...)
-            # We need to capture them and map them to their OLD number.
-            
-            source_paras = [] # List of Range objects (pointers might be unstable if we edit, so we copy to temp doc immediately)
-            
-            # Create Temp Doc
-            temp_doc = self.word.Documents.Add(Visible=False)
-            
-            # Iterate and copy to temp doc
-            # We need to know which old number corresponds to which paragraph.
-            # Assumption: The first REF-N paragraph found is Ref #1, second is #2, etc.
-            # This relies on the input doc being ordered 1..N initially (even if citations are out of order).
-            # If the input doc is ALREADY out of order (e.g. Ref list is 1, 5, 2...), this assumption fails.
-            # BUT, `_get_reference_numbers` just scrapes numbers.
-            # Let's assume standard scientific writing: References are listed 1..N.
-            
-            original_ref_map = {} # old_number -> temp_doc_range
-            
-            current_ref_idx = 0
-            for para in self.doc.Paragraphs:
-                try:
-                    if para.Range.Style == refpara_style or getattr(para.Range.Style, 'NameLocal', '') == 'REF-N':
-                        # This is a reference paragraph.
-                        # Which number is it?
-                        # We can try to extract the number from it to be sure.
-                        txt = para.Range.Text
-                        extracted = self._extract_numbers(txt)
-                        if extracted:
-                            # Use the first number found as the identifier
-                            old_num = extracted[0]
-                        else:
-                            # Fallback to index if extraction fails (risky)
-                            if current_ref_idx < len(ref_numbers):
-                                old_num = ref_numbers[current_ref_idx]
-                            else:
-                                old_num = -1 # Unknown
-                        
-                        current_ref_idx += 1
-                        
-                        # Copy to temp doc
-                        para.Range.Copy()
-                        # PasteAppend
-                        rng_end = temp_doc.Content
-                        rng_end.Collapse(0) # End
-                        rng_end.Paste()
-                        
-                        # Store the range in temp doc that corresponds to this old_num
-                        # The pasted paragraph is the last one in temp_doc
-                        original_ref_map[old_num] = temp_doc.Paragraphs.Last.Range
-                except Exception:
-                    continue
-            
-            # B. Renumber Citations and References (No Physical Sorting)
-            # Strategy: Build a mapping of old numbers to new numbers based on citation order,
-            # then update the numbers in both citations and references
-            
-            # Step 1: Build citation order to create renumber map
-            citation_order = []  # Track unique citation numbers in order of appearance
-            try:
-                cite_style = self.doc.Styles("cite_bib")
-            except Exception:
-                cite_style = None
-            
-            if cite_style:
-                # Find all citations and track their order
-                rng = self.doc.Content
-                rng.Find.ClearFormatting()
-                rng.Find.Style = cite_style
-                rng.Find.Text = ""
-                
-                while rng.Find.Execute():
-                    text = rng.Text.strip()
-                    nums = self._extract_numbers(text)
-                    
-                    # Add each number to citation_order if not already there
-                    for num in nums:
-                        if num not in citation_order:
-                            citation_order.append(num)
-                    
-                    rng.Collapse(0)
-            
-            # Build renumber map from citation order
-            if citation_order:
-                renumber_map = {old: new for new, old in enumerate(citation_order, start=1)}
-            else:
-                renumber_map = renumber_map  # Use the existing one from earlier
-            
-            # Step 2: Update citation numbers in text
-            if cite_style:
-                rng = self.doc.Content
-                rng.Find.ClearFormatting()
-                rng.Find.Style = cite_style
-                rng.Find.Text = ""
-                
-                while rng.Find.Execute():
-                    text = rng.Text.strip()
-                    nums = self._extract_numbers(text)
-                    
-                    if nums:
-                        # Map numbers
-                        mapped = [renumber_map.get(n, n) for n in nums]
-                        new_text = self._numbers_to_string(mapped)
-                        
-                        # Replace the numeric portion
-                        new_display = re.sub(r'\d+(-\d+)?', lambda m: self._mapped_segment(m.group(0), renumber_map), text)
-                        if not re.search(r'\d', new_display):
-                            new_display = new_text
-                        
-                        try:
-                            rng.Text = new_display
-                        except Exception:
-                            pass
-                    
-                    rng.Collapse(0)
-            
-            # Step 3: Update reference list numbers (bib_number style)
-            try:
-                bib_style = self.doc.Styles("bib_number")
-            except Exception:
-                bib_style = None
-            
-            if bib_style:
-                rng = self.doc.Content
-                rng.Find.ClearFormatting()
-                rng.Find.Style = bib_style
-                rng.Find.Text = ""
-                
-                while rng.Find.Execute():
-                    txt = rng.Text.strip()
-                    if txt:
-                        # Extract the number and replace with mapped value
-                        match = re.search(r'\d+', txt)
-                        if match:
-                            old_num = int(match.group())
-                            new_num = renumber_map.get(old_num, old_num)
-                            new_txt = re.sub(r'\d+', str(new_num), txt)
-                            try:
-                                rng.Text = new_txt
-                            except Exception:
-                                pass
-                    
-                    rng.Collapse(0)
-
-            # C. Update Numbers in the Sorted List
-            # Now that the list is sorted, we need to update the visible numbers (e.g. change "2." to "1.")
-            # We iterate again.
-            
-            current_idx = 1
-            for para in self.doc.Paragraphs:
-                 if para.Range.Style == refpara_style or getattr(para.Range.Style, 'NameLocal', '') == 'REF-N':
-                     # Find bib_number in this paragraph
-                     p_rng = para.Range
-                     try:
-                         bib_style = self.doc.Styles("bib_number")
-                         p_rng.Find.ClearFormatting()
-                         p_rng.Find.Style = bib_style
-                         p_rng.Find.Text = ""
-                         if p_rng.Find.Execute():
-                             # Found the number. Replace it.
-                             old_txt = p_rng.Text
-                             # Regex replace the number part
-                             new_txt = re.sub(r'\d+', str(current_idx), old_txt)
-                             p_rng.Text = new_txt
-                     except:
-                         pass
-                     
-                     current_idx += 1
-
-            # Close temp doc
-            temp_doc.Close(SaveChanges=False)
+        # Reorder and renumber reference list
+        self._reorder_references(renumber_map, ordered_all)
 
         # Save document
         try:
             if save_path:
                 self.doc.SaveAs(FileName=os.path.abspath(save_path))
             else:
-                # Overwrite existing document
                 self.doc.Save()
         except Exception:
             # Some Word versions use SaveAs2
@@ -376,6 +160,185 @@ class ReferenceValidator:
                 return {'renumbered': False, 'message': f'Failed to save document: {e}'}
 
         return {'renumbered': True, 'map': renumber_map}
+
+    def _update_citations(self, renumber_map):
+        """Update all citation numbers in the text."""
+        try:
+            cite_style = self.doc.Styles("cite_bib")
+        except Exception:
+            return
+
+        rng = self.doc.Content
+        rng.Find.ClearFormatting()
+        rng.Find.Style = cite_style
+        rng.Find.Text = ""
+
+        while rng.Find.Execute():
+            text = rng.Text.strip()
+            if not text:
+                rng.Collapse(0)
+                continue
+            
+            nums = self._extract_numbers(text)
+            if not nums:
+                rng.Collapse(0)
+                continue
+
+            # Map numbers and create new display text
+            new_display = re.sub(
+                r'\d+(-\d+)?', 
+                lambda m: self._mapped_segment(m.group(0), renumber_map), 
+                text
+            )
+            
+            if not re.search(r'\d', new_display):
+                mapped = [renumber_map.get(n, n) for n in nums]
+                new_display = self._numbers_to_string(mapped)
+
+            try:
+                rng.Text = new_display
+            except Exception:
+                pass
+            rng.Collapse(0)
+
+    def _reorder_references(self, renumber_map, ordered_all):
+        """
+        Physically reorder reference list paragraphs based on the new citation order.
+        Strategy: Extract all REF-N paragraphs, map them to old numbers, then insert them
+        back in the correct order.
+        """
+        try:
+            refpara_style = self.doc.Styles("REF-N")
+        except Exception:
+            # If REF-N style not found, try updating bib_number style only
+            self._update_bib_numbers_only(renumber_map)
+            return
+
+        try:
+            bib_char_style = self.doc.Styles("bib_number")
+        except Exception:
+            bib_char_style = None
+
+        # Step 1: Collect all reference paragraphs with their old numbers
+        ref_paras = []  # List of dicts with old_num, text, para reference
+        
+        for para in self.doc.Paragraphs:
+            try:
+                if para.Range.Style == refpara_style or getattr(para.Range.Style, 'NameLocal', '') == 'REF-N':
+                    # Extract the old reference number
+                    txt = para.Range.Text
+                    old_num = self._extract_first_number_from_para(para, bib_char_style)
+                    
+                    if old_num is not None:
+                        ref_paras.append({
+                            'old_num': old_num,
+                            'text': txt,
+                            'para': para
+                        })
+            except Exception:
+                continue
+
+        if not ref_paras:
+            return
+
+        # Step 2: Find the position where references start
+        first_ref_para = ref_paras[0]['para']
+        insert_position = first_ref_para.Range.Start
+
+        # Step 3: Delete all existing reference paragraphs (in reverse to avoid index shifts)
+        for ref_data in reversed(ref_paras):
+            try:
+                ref_data['para'].Range.Delete()
+            except Exception:
+                pass
+
+        # Step 4: Create a mapping from old number to reference data
+        ref_map = {item['old_num']: item for item in ref_paras}
+
+        # Step 5: Insert references in new order
+        insertion_range = self.doc.Range(insert_position, insert_position)
+        
+        for new_num, old_num in enumerate(ordered_all, start=1):
+            if old_num not in ref_map:
+                continue
+            
+            ref_data = ref_map[old_num]
+            old_text = ref_data['text']
+            
+            # Update the reference number in the text
+            new_text = self._update_reference_number(old_text, old_num, new_num)
+            
+            # Insert the paragraph
+            try:
+                insertion_range.InsertAfter(new_text)
+                insertion_range.InsertParagraphAfter()
+                
+                # Apply REF-N style to the newly inserted paragraph
+                new_para_range = self.doc.Range(
+                    insertion_range.Start, 
+                    insertion_range.End - 1  # Exclude the paragraph mark
+                )
+                new_para_range.Style = refpara_style
+                
+                # Update insertion point for next reference
+                insertion_range = self.doc.Range(insertion_range.End, insertion_range.End)
+            except Exception as e:
+                print(f"Error inserting reference {new_num}: {e}")
+                continue
+
+    def _extract_first_number_from_para(self, para, bib_char_style=None):
+        """Extract the first number from a paragraph, preferring bib_number style."""
+        if bib_char_style:
+            try:
+                p_rng = para.Range
+                p_rng.Find.ClearFormatting()
+                p_rng.Find.Style = bib_char_style
+                p_rng.Find.Text = ""
+                if p_rng.Find.Execute():
+                    bib_text = p_rng.Text.strip()
+                    match = re.search(r'\d+', bib_text)
+                    if match:
+                        return int(match.group())
+            except Exception:
+                pass
+        
+        # Fallback: extract first number from text
+        text = para.Range.Text.strip()
+        match = re.search(r'\b\d+\b', text)
+        return int(match.group()) if match else None
+
+    def _update_reference_number(self, text, old_num, new_num):
+        """Update the reference number in a reference paragraph text."""
+        # Replace first occurrence of old number with new number
+        pattern = r'\b' + str(old_num) + r'\b'
+        new_text = re.sub(pattern, str(new_num), text, count=1)
+        return new_text
+
+    def _update_bib_numbers_only(self, renumber_map):
+        """Fallback method to update bib_number style when REF-N is not available."""
+        try:
+            bib_style = self.doc.Styles("bib_number")
+        except Exception:
+            return
+        
+        rng = self.doc.Content
+        rng.Find.ClearFormatting()
+        rng.Find.Style = bib_style
+        rng.Find.Text = ""
+        
+        while rng.Find.Execute():
+            txt = rng.Text.strip()
+            if txt:
+                match = re.search(r'\d+', txt)
+                if match:
+                    old_num = int(match.group())
+                    new_num = renumber_map.get(old_num, old_num)
+                    new_txt = re.sub(r'\d+', str(new_num), txt)
+                    try:
+                        rng.Text = new_txt
+                    except Exception:
+                        pass
+            rng.Collapse(0)
 
     def _mapped_segment(self, seg, renumber_map):
         """Map a segment like '2' or '2-4' using renumber_map and return a string representation."""
